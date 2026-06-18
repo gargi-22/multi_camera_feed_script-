@@ -6,7 +6,11 @@ import com.sun.net.httpserver.HttpServer;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.BindException;
+import java.net.NetworkInterface;
+import java.util.Enumeration;
 import java.util.concurrent.Executors;
 
 import org.opencv.core.*;
@@ -51,6 +55,11 @@ public class CameraStreamingServer {
             }
         }
 
+        if (port < 0 || port > 65535) {
+            System.err.println("Invalid port number: " + port + ". Must be between 0 and 65535.");
+            return;
+        }
+
         try {
             nu.pattern.OpenCV.loadLocally();
         } catch (Exception e) {
@@ -69,7 +78,20 @@ public class CameraStreamingServer {
         System.out.println("Opened " + captures.length + " camera(s): indices "
                 + formatIndices(cameraIndices));
 
-        HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
+        HttpServer server;
+        try {
+            InetSocketAddress bindAddress = new InetSocketAddress("0.0.0.0", port);
+            server = HttpServer.create(bindAddress, 0);
+        } catch (BindException e) {
+            System.err.println("Port " + port + " is already in use. "
+                    + "Please stop the other process or choose a different port.");
+            System.err.println("Usage: ... -Dexec.args=\"<port> [camera_indices...]\" (e.g. 8080 0 1)");
+            for (VideoCapture c : captures) {
+                if (c != null) c.release();
+            }
+            return;
+        }
+
         server.createContext("/stitch", new LiveStitchHandler(captures));
         server.createContext("/play", new CommonHandlers.PlayerPageHandler());
         server.createContext("/meta", new CommonHandlers.MetaHandler(
@@ -79,18 +101,41 @@ public class CameraStreamingServer {
         server.setExecutor(Executors.newFixedThreadPool(4));
         server.start();
 
+        System.out.println("Server started on port " + port);
         System.out.println("Live stream     →  http://localhost:" + port + "/play");
         System.out.println("MJPEG stream    →  http://localhost:" + port + "/stitch");
         System.out.println("Single snapshot →  http://localhost:" + port + "/snapshot");
         System.out.println("Metadata        →  http://localhost:" + port + "/meta");
+        printNetworkAddresses(port);
 
+        HttpServer finalServer = server;
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             System.out.println("\nShutting down — releasing cameras...");
             for (VideoCapture c : captures) {
                 if (c != null) c.release();
             }
-            server.stop(1);
+            finalServer.stop(1);
         }));
+    }
+
+    static void printNetworkAddresses(int port) {
+        try {
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces.hasMoreElements()) {
+                NetworkInterface ni = interfaces.nextElement();
+                if (ni.isLoopback() || !ni.isUp()) continue;
+                Enumeration<InetAddress> addresses = ni.getInetAddresses();
+                while (addresses.hasMoreElements()) {
+                    InetAddress addr = addresses.nextElement();
+                    if (addr instanceof java.net.Inet4Address) {
+                        System.out.println("Network access  →  http://"
+                                + addr.getHostAddress() + ":" + port + "/play");
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // ignore — network address discovery is best-effort
+        }
     }
 
     // -----------------------------------------------------------------
