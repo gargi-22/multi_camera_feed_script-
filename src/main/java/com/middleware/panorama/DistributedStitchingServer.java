@@ -4,19 +4,23 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.BindException;
+import java.net.HttpURLConnection;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
+import java.net.URL;
 import java.util.Enumeration;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.opencv.core.*;
+import org.opencv.imgcodecs.Imgcodecs;
 import org.opencv.imgproc.Imgproc;
-import org.opencv.videoio.VideoCapture;
 import org.opencv.videoio.VideoWriter;
 
 /**
@@ -25,6 +29,8 @@ import org.opencv.videoio.VideoWriter;
  * Reads MJPEG streams from remote camera nodes (each running
  * {@link CameraStreamingServer}), stitches them into a panorama,
  * records the output as an MP4 file, and serves a live MJPEG preview.
+ *
+ * Uses Java HTTP client to read MJPEG streams (no FFMPEG dependency).
  *
  * Usage:
  *   java DistributedStitchingServer &lt;output.mp4&gt; &lt;url1&gt; [url2] ...
@@ -85,20 +91,20 @@ public class DistributedStitchingServer {
             }
         }
 
-        VideoCapture[] captures = openStreams(urls);
-        if (captures == null) return;
+        MjpegStreamReader[] readers = openStreams(urls);
+        if (readers == null) return;
 
-        System.out.println("Connected to " + captures.length + " remote stream(s).");
+        System.out.println("Connected to " + readers.length + " remote stream(s).");
 
         int overlap = StitchingCore.clampOverlap(OVERLAP_PX, TARGET_WIDTH);
-        int panoW = StitchingCore.panoramaWidth(captures.length, TARGET_WIDTH, overlap);
+        int panoW = StitchingCore.panoramaWidth(readers.length, TARGET_WIDTH, overlap);
 
         int fourcc = VideoWriter.fourcc('m', 'p', '4', 'v');
         VideoWriter writer = new VideoWriter(outputPath, fourcc, FPS,
                 new Size(panoW, TARGET_HEIGHT));
         if (!writer.isOpened()) {
             System.err.println("Cannot create MP4 output file: " + outputPath);
-            releaseCaptures(captures);
+            closeReaders(readers);
             return;
         }
         System.out.println("Recording to: " + outputPath);
@@ -110,7 +116,7 @@ public class DistributedStitchingServer {
             System.err.println("Port " + port + " is already in use. "
                     + "Please stop the other process or choose a different port.");
             writer.release();
-            releaseCaptures(captures);
+            closeReaders(readers);
             return;
         }
 
@@ -128,7 +134,7 @@ public class DistributedStitchingServer {
         server.start();
 
         Thread captureThread = new Thread(
-                () -> captureLoop(captures, writer), "capture-stitch");
+                () -> captureLoop(readers, writer), "capture-stitch");
         captureThread.setDaemon(true);
         captureThread.start();
 
@@ -144,31 +150,154 @@ public class DistributedStitchingServer {
             System.out.println("\nShutting down \u2014 finalizing MP4...");
             captureThread.interrupt();
             writer.release();
-            releaseCaptures(captures);
+            closeReaders(readers);
             finalServer.stop(1);
             System.out.println("MP4 saved to: " + outputPath);
         }));
     }
 
     // -----------------------------------------------------------------
+    //  MJPEG Stream Reader — reads frames via Java HTTP client
+    // -----------------------------------------------------------------
+
+    static class MjpegStreamReader {
+        private final String url;
+        private InputStream inputStream;
+        private HttpURLConnection connection;
+
+        MjpegStreamReader(String url) {
+            this.url = url;
+        }
+
+        boolean connect() {
+            try {
+                URL streamUrl = new URL(url);
+                connection = (HttpURLConnection) streamUrl.openConnection();
+                connection.setConnectTimeout(10000);
+                connection.setReadTimeout(10000);
+                connection.setRequestMethod("GET");
+                connection.connect();
+
+                int code = connection.getResponseCode();
+                if (code != 200) {
+                    System.err.println("HTTP " + code + " from " + url);
+                    return false;
+                }
+                inputStream = connection.getInputStream();
+                return true;
+            } catch (IOException e) {
+                System.err.println("Cannot connect to " + url + ": " + e.getMessage());
+                return false;
+            }
+        }
+
+        byte[] readFrame() throws IOException {
+            if (inputStream == null) return null;
+
+            // Skip until we find the JPEG start marker (after boundary + headers)
+            // The MJPEG format: --frame\r\nContent-Type: ...\r\nContent-Length: N\r\n\r\n<jpeg>\r\n
+            int contentLength = -1;
+            String line;
+
+            // Read headers until empty line
+            while ((line = readLine()) != null) {
+                if (line.isEmpty()) break;
+                if (line.startsWith("Content-Length:") || line.startsWith("content-length:")) {
+                    try {
+                        contentLength = Integer.parseInt(line.substring(line.indexOf(':') + 1).trim());
+                    } catch (NumberFormatException ignored) {}
+                }
+            }
+
+            if (contentLength > 0) {
+                // Read exact number of bytes
+                byte[] data = new byte[contentLength];
+                int offset = 0;
+                while (offset < contentLength) {
+                    int read = inputStream.read(data, offset, contentLength - offset);
+                    if (read == -1) throw new IOException("Stream ended prematurely");
+                    offset += read;
+                }
+                // Skip trailing \r\n
+                readLine();
+                return data;
+            } else {
+                // Fallback: scan for JPEG SOI/EOI markers
+                return readFrameByMarkers();
+            }
+        }
+
+        private byte[] readFrameByMarkers() throws IOException {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream(65536);
+            int prev = -1;
+            boolean started = false;
+
+            while (true) {
+                int b = inputStream.read();
+                if (b == -1) throw new IOException("Stream ended");
+
+                if (!started) {
+                    if (prev == 0xFF && b == 0xD8) {
+                        started = true;
+                        baos.write(0xFF);
+                        baos.write(0xD8);
+                    }
+                    prev = b;
+                    continue;
+                }
+
+                baos.write(b);
+                if (prev == 0xFF && b == 0xD9) {
+                    // End of JPEG
+                    return baos.toByteArray();
+                }
+                prev = b;
+            }
+        }
+
+        private String readLine() throws IOException {
+            StringBuilder sb = new StringBuilder();
+            int c;
+            while ((c = inputStream.read()) != -1) {
+                if (c == '\r') {
+                    int next = inputStream.read();
+                    if (next == '\n') break;
+                    sb.append((char) c);
+                    if (next != -1) sb.append((char) next);
+                } else if (c == '\n') {
+                    break;
+                } else {
+                    sb.append((char) c);
+                }
+            }
+            return c == -1 && sb.length() == 0 ? null : sb.toString();
+        }
+
+        void close() {
+            try {
+                if (inputStream != null) inputStream.close();
+            } catch (IOException ignored) {}
+            if (connection != null) connection.disconnect();
+        }
+    }
+
+    // -----------------------------------------------------------------
     //  Background capture, stitch, and record loop
     // -----------------------------------------------------------------
 
-    static void captureLoop(VideoCapture[] captures, VideoWriter writer) {
+    static void captureLoop(MjpegStreamReader[] readers, VideoWriter writer) {
         StitchingCore.StitchWorkspace ws =
                 new StitchingCore.StitchWorkspace(TARGET_HEIGHT, TARGET_WIDTH, OVERLAP_PX);
 
-        Mat[] frames  = new Mat[captures.length];
-        Mat[] resized = new Mat[captures.length];
-        for (int i = 0; i < captures.length; i++) {
-            frames[i]  = new Mat();
+        Mat[] resized = new Mat[readers.length];
+        for (int i = 0; i < readers.length; i++) {
             resized[i] = new Mat();
         }
 
         int failCount = 0;
 
         while (!Thread.currentThread().isInterrupted()) {
-            boolean ok = readAndResize(captures, frames, resized);
+            boolean ok = readAndDecodeFrames(readers, resized);
             if (!ok) {
                 failCount++;
                 if (failCount > 30) {
@@ -206,14 +335,22 @@ public class DistributedStitchingServer {
         ws.release();
     }
 
-    static boolean readAndResize(VideoCapture[] captures, Mat[] frames, Mat[] resized) {
-        synchronized (captures) {
-            for (int i = 0; i < captures.length; i++) {
-                if (!captures[i].read(frames[i]) || frames[i].empty()) {
+    static boolean readAndDecodeFrames(MjpegStreamReader[] readers, Mat[] resized) {
+        for (int i = 0; i < readers.length; i++) {
+            try {
+                byte[] jpegData = readers[i].readFrame();
+                if (jpegData == null) return false;
+
+                Mat raw = Imgcodecs.imdecode(new MatOfByte(jpegData), Imgcodecs.IMREAD_COLOR);
+                if (raw.empty()) {
+                    raw.release();
                     return false;
                 }
-                Imgproc.resize(frames[i], resized[i],
-                        new Size(TARGET_WIDTH, TARGET_HEIGHT));
+
+                Imgproc.resize(raw, resized[i], new Size(TARGET_WIDTH, TARGET_HEIGHT));
+                raw.release();
+            } catch (IOException e) {
+                return false;
             }
         }
         return true;
@@ -261,25 +398,25 @@ public class DistributedStitchingServer {
     //  Stream management
     // -----------------------------------------------------------------
 
-    static VideoCapture[] openStreams(String[] urls) {
-        VideoCapture[] caps = new VideoCapture[urls.length];
+    static MjpegStreamReader[] openStreams(String[] urls) {
+        MjpegStreamReader[] readers = new MjpegStreamReader[urls.length];
         for (int i = 0; i < urls.length; i++) {
             System.out.println("Connecting to: " + urls[i]);
-            caps[i] = new VideoCapture(urls[i]);
-            if (!caps[i].isOpened()) {
+            readers[i] = new MjpegStreamReader(urls[i]);
+            if (!readers[i].connect()) {
                 System.err.println("Cannot open remote stream: " + urls[i]);
                 System.err.println("Make sure the camera node is running and accessible.");
-                for (int j = 0; j <= i; j++) caps[j].release();
+                for (int j = 0; j <= i; j++) readers[j].close();
                 return null;
             }
             System.out.println("Connected: " + urls[i]);
         }
-        return caps;
+        return readers;
     }
 
-    static void releaseCaptures(VideoCapture[] caps) {
-        for (VideoCapture c : caps) {
-            if (c != null) c.release();
+    static void closeReaders(MjpegStreamReader[] readers) {
+        for (MjpegStreamReader r : readers) {
+            if (r != null) r.close();
         }
     }
 
