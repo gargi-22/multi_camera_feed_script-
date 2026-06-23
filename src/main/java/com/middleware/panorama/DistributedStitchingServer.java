@@ -101,8 +101,10 @@ public class DistributedStitchingServer {
 
         VideoWriter writer = openVideoWriter(outputPath, panoW, TARGET_HEIGHT);
         if (writer == null) {
-            closeReaders(readers);
-            return;
+            System.out.println("WARNING: MP4 recording disabled (no codec available).");
+            System.out.println("Live stitching will still work. Install ffmpeg for recording:");
+            System.out.println("  Ubuntu/Debian: sudo apt-get install ffmpeg");
+            System.out.println("  Windows: download from https://ffmpeg.org/download.html");
         }
 
         HttpServer server;
@@ -111,7 +113,7 @@ public class DistributedStitchingServer {
         } catch (BindException e) {
             System.err.println("Port " + port + " is already in use. "
                     + "Please stop the other process or choose a different port.");
-            writer.release();
+            if (writer != null) writer.release();
             closeReaders(readers);
             return;
         }
@@ -129,8 +131,9 @@ public class DistributedStitchingServer {
         server.setExecutor(Executors.newFixedThreadPool(4));
         server.start();
 
+        final VideoWriter finalWriter = writer;
         Thread captureThread = new Thread(
-                () -> captureLoop(readers, writer), "capture-stitch");
+                () -> captureLoop(readers, finalWriter), "capture-stitch");
         captureThread.setDaemon(true);
         captureThread.start();
 
@@ -138,17 +141,21 @@ public class DistributedStitchingServer {
         System.out.println("Live stream  \u2192  http://localhost:" + port + "/play");
         System.out.println("MJPEG stream \u2192  http://localhost:" + port + "/stitch");
         System.out.println("Metadata     \u2192  http://localhost:" + port + "/meta");
-        System.out.println("MP4 output   \u2192  " + outputPath + " (finalized on shutdown)");
+        if (writer != null) {
+            System.out.println("MP4 output   \u2192  " + outputPath + " (finalized on shutdown)");
+        }
         printNetworkAddresses(port);
 
         HttpServer finalServer = server;
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("\nShutting down \u2014 finalizing MP4...");
+            System.out.println("\nShutting down...");
             captureThread.interrupt();
-            writer.release();
+            if (finalWriter != null) {
+                finalWriter.release();
+                System.out.println("MP4 saved to: " + outputPath);
+            }
             closeReaders(readers);
             finalServer.stop(1);
-            System.out.println("MP4 saved to: " + outputPath);
         }));
     }
 
@@ -309,8 +316,10 @@ public class DistributedStitchingServer {
             Mat panorama = StitchingCore.featherStitchOptimised(
                     resized, TARGET_WIDTH, TARGET_HEIGHT, OVERLAP_PX, ws);
 
-            synchronized (writer) {
-                writer.write(panorama);
+            if (writer != null) {
+                synchronized (writer) {
+                    writer.write(panorama);
+                }
             }
 
             byte[] jpeg = StitchingCore.encodeJpeg(panorama, JPEG_QUALITY);
