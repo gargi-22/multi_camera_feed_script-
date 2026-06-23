@@ -99,15 +99,11 @@ public class DistributedStitchingServer {
         int overlap = StitchingCore.clampOverlap(OVERLAP_PX, TARGET_WIDTH);
         int panoW = StitchingCore.panoramaWidth(readers.length, TARGET_WIDTH, overlap);
 
-        int fourcc = VideoWriter.fourcc('m', 'p', '4', 'v');
-        VideoWriter writer = new VideoWriter(outputPath, fourcc, FPS,
-                new Size(panoW, TARGET_HEIGHT));
-        if (!writer.isOpened()) {
-            System.err.println("Cannot create MP4 output file: " + outputPath);
+        VideoWriter writer = openVideoWriter(outputPath, panoW, TARGET_HEIGHT);
+        if (writer == null) {
             closeReaders(readers);
             return;
         }
-        System.out.println("Recording to: " + outputPath);
 
         HttpServer server;
         try {
@@ -418,6 +414,41 @@ public class DistributedStitchingServer {
         for (MjpegStreamReader r : readers) {
             if (r != null) r.close();
         }
+    }
+
+    // -----------------------------------------------------------------
+    //  Video writer with codec fallback
+    // -----------------------------------------------------------------
+
+    static VideoWriter openVideoWriter(String outputPath, int width, int height) {
+        int[][] codecs = {
+            {'m', 'p', '4', 'v'},
+            {'a', 'v', 'c', '1'},
+            {'X', 'V', 'I', 'D'},
+            {'M', 'J', 'P', 'G'},
+        };
+        String[] codecNames = {"mp4v", "avc1", "XVID", "MJPG"};
+
+        // For MJPG fallback, use .avi extension
+        String baseName = outputPath.replaceAll("\\.[^.]+$", "");
+
+        for (int i = 0; i < codecs.length; i++) {
+            int fourcc = VideoWriter.fourcc(
+                    (char) codecs[i][0], (char) codecs[i][1],
+                    (char) codecs[i][2], (char) codecs[i][3]);
+            String path = (i == 3) ? baseName + ".avi" : outputPath;
+            VideoWriter writer = new VideoWriter(path, fourcc, FPS, new Size(width, height));
+            if (writer.isOpened()) {
+                System.out.println("Recording to: " + path + " (codec: " + codecNames[i] + ")");
+                return writer;
+            }
+            writer.release();
+            System.out.println("Codec " + codecNames[i] + " not available, trying next...");
+        }
+
+        System.err.println("Cannot create video output file. No suitable codec found.");
+        System.err.println("Try installing ffmpeg: sudo apt-get install ffmpeg");
+        return null;
     }
 
     // -----------------------------------------------------------------
